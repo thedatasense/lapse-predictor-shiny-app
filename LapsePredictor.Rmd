@@ -1,0 +1,829 @@
+---
+title: "LIMRA Lapse Predictor"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    css: css/styles-default.css
+    logo: img/logo-cannondale.png
+runtime: shiny
+---
+
+
+```{r}
+
+local({
+  r <- getOption("repos")
+  r["h2o"] <- "http://h2o-release.s3.amazonaws.com/h2o/latest_stable_R/"
+  r["CRAN"] <- "https://cran.rstudio.com/"
+  options(repos = r)
+})
+
+
+```
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(shinyWidgets)
+library(shinyjs)
+library(lime)
+library(fontawesome)
+library(arulesViz)
+library(ggfortify)
+# Core
+library(tidyverse)
+library(tidyquant)
+library(igraph)
+library(survival)
+library(ranger)
+
+library(knitr)
+# Interactive Visualizations
+library(plotly)
+library(caret)
+library(recipes)
+library(arules)
+library(visNetwork)
+
+# Database
+library(odbc)
+library(h2o)
+library(RSQLite)
+```
+```{r include=FALSE}
+#h2o.init(max_mem_size = "24g",ip = "tbinh2olab.eastus.cloudapp.azure.com", startH2O=FALSE)
+
+h2o.init(max_mem_size = "24g")
+
+uniqueProdTypeCodes <- read.csv('./data/producttypelookup.csv')
+prodTypeCodes <- uniqueProdTypeCodes %>%
+  pull(description)
+
+getProductTypeCode <- function(codedesc) {
+  return (uniqueProdTypeCodes %>%
+  filter(description == codedesc ) %>%
+  pull(code))
+}
+
+uniqueDistCodes <- read.csv('./data/distchannellookup.csv')
+distTypeCodes <- uniqueDistCodes %>%
+  pull(description)
+
+
+getDistCode <- function(codedesc) {
+  return (uniqueDistCodes %>%
+  filter(description == codedesc ) %>%
+  pull(code))
+}
+
+
+xgboost1 <- h2o.loadModel("./h2o_models/millenial/XGBoost_2_AutoML_20191117_182234")
+xgboost2 <- h2o.loadModel("./h2o_models/millenial/XGBoost_1_AutoML_20191117_182234")
+GBM <- h2o.loadModel("./h2o_models/millenial/GBM_1_AutoML_20191117_182234")
+
+uniquePolicy <- as_tibble(readRDS("./data/data_modelling_V6_no_missing.rds")) 
+statecodes <- read_rds('./data/statecodes.rds')
+
+businessstrategy <- read_csv('./data/businessstratergy.csv')
+uniqueProdType <- 
+  sort(unique(uniquePolicy$PRODTYPE))
+
+uniqueRiskClass <- 
+  sort(unique(uniquePolicy$XPRIMRISKSTDCLASS)) %>%
+  levels 
+
+umempincome <- uniquePolicy %>%
+  select(ISSUESTATE,XMEDHINCOME,XUMEMPRT) %>%
+  unique() %>%
+  arrange(ISSUESTATE)
+
+uniqueDistChannel <- 
+  as.character(sort(unique(uniquePolicy$DISTCHANNEL)))
+
+topredict <- tibble(
+    PRODTYPE = 4,
+    PRIMGENDER = "F",
+    ISSUESTATE = "NC",
+    DISTCHANNEL = 2,
+    XPRIMRISKSTDCLASS = "Unknown",
+    XPRIMAGE1 = 35,
+    XANNPLANNEDPREM = 	467.6,
+    XCREDITEDRATEBOY = -0.01725,
+    XFAMTBOY = 	590000,
+    XUMEMPRT = 	9.75,
+    XMEDHINCOME = 47.0
+    #       XDURATION  = 3,
+
+)
+
+
+
+#Dropping columns that are not needed for Binary classification
+dataFModel <- uniquePolicy %>%
+    subset(select = -c(TERMDATE,ISSUEDATE,X,X1PREMPERYEAR,ISSUEDATE))
+
+col_factors_model <- c('XLABEL','XSECPOLICYHOLDER','DISTCHANNEL','PRODTYPE')
+dataFModel[col_factors_model] <- lapply(dataFModel[col_factors_model], factor)  ## as.factor() could also be used
+
+#Anyone born between 1981 and 1996 (ages 23 to 38 in 2019) is considered a Millennial
+dataFModel <- dataFModel %>%
+    select(-c(POLICYNO)) %>%
+    filter(XPRIMAGE1 < 39 & XPRIMAGE1 > 22)
+
+
+train.index <- createDataPartition(dataFModel$XLABEL, p = .8, list = FALSE)
+train <- dataFModel[ train.index,]
+test  <- dataFModel[-train.index,]
+
+# Bake the data - complete all the preprocessing Steps ----
+
+recipe_obj <- recipe(XLABEL ~ ., data = dataFModel)%>%
+    step_zv(all_predictors()) %>%
+    prep()
+
+train_tbl <- bake(recipe_obj, new_data = train)
+test_tbl <- bake(recipe_obj, new_data = test)
+
+test_h2o  <- as.h2o(test_tbl)
+mdl_performance <- h2o.performance(xgboost2, newdata = as.h2o(test_h2o))
+
+performance_tbl <- mdl_performance %>%
+  h2o.metric() %>%
+  as_tibble() 
+
+explainer <- train_tbl %>%
+    select(-XLABEL) %>%
+    lime(
+        model           = xgboost2,
+        #bin_continuous  = TRUE,
+        n_bins          = 3,
+        quantile_bins   = TRUE
+    )
+
+
+
+pcr_plot <- reactive({  performance_tbl %>%
+  ggplot(aes(x = threshold)) +
+  geom_line(aes(y = precision), color = "blue", size = 1) +
+  geom_line(aes(y = recall), color = "red", size = 1) +
+  geom_vline(xintercept = h2o.find_threshold_by_max_metric(mdl_performance, "f1")) +
+  theme_tq() +
+  labs(title = "Precision vs Recall", y = "value") }
+)
+
+
+
+roc_plot <- reactive({  list(xgboost1,xgboost2,GBM) %>% 
+  # map a function to each element in the list
+  map(function(x) x %>% h2o.performance(valid=T) %>% 
+        # from all these 'paths' in the object
+        .@metrics %>% .$thresholds_and_metric_scores %>% 
+        # extracting true positive rate and false positive rate
+        .[c('tpr','fpr')] %>% 
+        # add (0,0) and (1,1) for the start and end point of ROC curve
+        add_row(tpr=0,fpr=0,.before=T) %>% 
+        add_row(tpr=0,fpr=0,.before=F)) %>% 
+  # add a column of model name for future grouping in ggplot2
+  map2(c('xgboost1','xgboost2','GBM'),
+       function(x,y) x %>% add_column(model=y)) %>% 
+  # reduce four data.frame to one
+  reduce(rbind) %>% 
+  # plot fpr and tpr, map model to color as grouping
+  ggplot(aes(fpr,tpr,col=model))+
+  geom_line()+
+  geom_segment(aes(x=0,y=0,xend = 1, yend = 1),linetype = 2,col='grey')+
+  xlab('False Positive Rate')+
+  ylab('True Positive Rate')+
+  ggtitle('ROC Curve for Four Models') })
+
+
+
+getAUC <- function() {
+  h2o.pr_auc(xgboost1, train = FALSE, valid = FALSE, xval = FALSE)
+  
+}
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+plotfeature <- function (ptble) {
+    ptble <- bake(recipe_obj, new_data = ptble)
+    explanation <- ptble %>%
+        select(-XLABEL) %>%
+        as.data.frame() %>%
+        lime::explain(
+            check.rows = FALSE,
+            explainer = explainer,
+            n_labels   = 1,
+            n_features = 8,
+            n_permutations = 5000,
+            kernel_width   = 3
+        )
+    return (plot_features(explanation = explanation, ncol = 1) + theme(axis.text.x = element_text(face="bold", color="#993333", 
+                           size=10, angle=45),
+          axis.text.y = element_text(face="bold", color="#993333", 
+                           size=10, angle=45)))
+}
+
+
+
+predicLapse <- function(topredict) {
+    rettbl <- tibble(field = numeric(), value = double())
+    pred <- as.data.frame(h2o.predict(xgboost2, as.h2o(topredict)))
+    p1 <- pull(pred, p1)
+    p0 <- pull(pred, p0)
+    if (p1 > p0) {
+        return (1 + p1)
+    } else {
+        return (p0)
+    }
+    
+}
+
+
+```
+```{r}
+
+
+
+
+```
+
+Predictor
+=====================================
+
+Column Column {.sidebar data-width=350}
+---------------------------------------------------------------
+     
+     
+```{r}
+     awesomeCheckboxGroup(
+                                         inputId = "gender",
+                                         label = "Gender",
+                                         choices = c("M", "F"),
+                                         selected = "F",
+                                         inline = TRUE,
+                                         status = "danger"
+     )
+
+
+sliderInput("age", "Primary Holder's Age:", 18, 38, 26)
+
+pickerInput(
+  inputId = "risk",
+  label = "Risk Category",
+  choices = uniqueRiskClass,
+  multiple = FALSE,
+  selected = "Badge danger",
+  choicesOpt = list(content = sprintf(
+    "<span class='label label-%s'>%s</span>",
+    c("success", "danger", "primary","danger
+      ","info","info" ),
+    uniqueRiskClass
+  ))
+)
+
+pickerInput(
+  inputId = "state",
+  label = "State : primary",
+  choices = as.character(pull(statecodes,"ISSUESTATE")),
+  options = list(style = "btn-primary")
+)
+
+
+pickerInput(
+  inputId = "distchannel",
+  label = "Distribution Channel",
+  choices = as.character(distTypeCodes),
+  options = list(style = "btn-primary")
+)
+br()
+
+shinyWidgets::pickerInput(
+  inputId  = "prodType", 
+  label    = h4("Product Type"), 
+  choices  = as.character(prodTypeCodes), 
+  multiple = FALSE,
+  options  = list(
+    `actions-box` = TRUE,
+    size = 10,
+    `selected-text-format` = "count > 3"
+  )
+)
+sliderInput("duration", "Duration:", 0, 50, 2)
+sliderInput("premium", "Annualized Premium:", 50, 100000, 5000)
+sliderInput("facevalue", "Face Value:", 50000, 10000000, 250000)
+sliderInput("creditedrate", "Credited Rate Change",-2, 2 , 0.05)
+br()
+br()
+
+actionButton(inputId = "apply", label = "Predict", icon = icon("play"))
+
+actionButton(inputId = "reset", label = "Reset", icon = icon("sync"))
+
+
+```
+
+```{r}
+
+predicted_result <- eventReactive(eventExpr = input$apply,
+                                  valueExpr =  {
+                                    umempincome_state <- umempincome %>%
+                                      filter(ISSUESTATE == input$state)
+                                    topredict <- tibble(
+                                      PRODTYPE = getProductTypeCode(input$prodType),
+                                      PRIMGENDER = input$gender,
+                                      ISSUESTATE = input$state,
+                                      DISTCHANNEL = getDistCode(input$distchannel),
+                                      XPRIMRISKSTDCLASS = input$risk,
+                                      XPRIMAGE1 = input$age,
+                                      XANNPLANNEDPREM = input$premium	,
+                                      XCREDITEDRATEBOY = input$creditedrate,
+                                      XFAMTBOY = 	input$facevalue,
+                                      XUMEMPRT = 	umempincome_state$XUMEMPRT,
+                                      XMEDHINCOME = umempincome_state$XMEDHINCOME ,
+                                       XDURATION  = input$duration,
+                                    )
+                                    col_factors_model <- c('ISSUESTATE','DISTCHANNEL','PRODTYPE','XPRIMRISKSTDCLASS','PRIMGENDER')
+                                    topredict[col_factors_model] <- lapply(topredict[col_factors_model], factor)  ## as.factor() could also be used
+                                    topredict <- bake(recipe_obj, new_data = topredict)
+                                    predicLapse(topredict)
+
+                                    })
+
+
+feature_importance <- eventReactive(eventExpr = input$apply, valueExpr ={
+  umempincome_state <- umempincome %>%
+    filter(ISSUESTATE == input$state)
+  topredict <- tibble(
+                                      PRODTYPE = getProductTypeCode(input$prodType),
+                                      PRIMGENDER = input$gender,
+                                      ISSUESTATE = input$state,
+                                      DISTCHANNEL = getDistCode(input$distchannel),
+                                      XPRIMRISKSTDCLASS = input$risk,
+                                      XPRIMAGE1 = input$age,
+                                      XANNPLANNEDPREM = input$premium	,
+                                      XCREDITEDRATEBOY = input$creditedrate,
+                                      XFAMTBOY = 	input$facevalue,
+                                      XUMEMPRT = 	umempincome_state$XUMEMPRT,
+                                      XMEDHINCOME = umempincome_state$XMEDHINCOME ,
+                                       XDURATION  = input$duration,
+                                    )
+                                    col_factors_model <- c('ISSUESTATE','DISTCHANNEL','PRODTYPE','XPRIMRISKSTDCLASS')
+                                    topredict[col_factors_model] <- lapply(topredict[col_factors_model], factor)  ## as.factor() could also be used
+                                    topredict <- bake(recipe_obj, new_data = topredict)
+                                    plotfeature(topredict)
+                                    
+  
+  
+}  )
+
+
+
+explanation_detailed <-
+  eventReactive(eventExpr = input$apply, valueExpr =
+                  {
+                    umempincome_state <- umempincome %>%
+                      filter(ISSUESTATE == input$state)
+                    topredict <- tibble(
+                      PRODTYPE = getProductTypeCode(input$prodType),
+                      PRIMGENDER = input$gender,
+                      ISSUESTATE = input$state,
+                      DISTCHANNEL = getDistCode(input$distchannel),
+                      XPRIMRISKSTDCLASS = input$risk,
+                      XPRIMAGE1 = input$age,
+                      XANNPLANNEDPREM = input$premium	,
+                      XCREDITEDRATEBOY = input$creditedrate,
+                      XFAMTBOY = 	input$facevalue,
+                      XUMEMPRT = 	umempincome_state$XUMEMPRT,
+                      XMEDHINCOME = umempincome_state$XMEDHINCOME ,
+                      XDURATION  = input$duration,
+                    )
+                    col_factors_model <-
+                      c('ISSUESTATE',
+                        'DISTCHANNEL',
+                        'PRODTYPE',
+                        'XPRIMRISKSTDCLASS')
+                    topredict[col_factors_model] <-
+                      lapply(topredict[col_factors_model], factor)  ## as.factor() could also be used
+                    topredict <-
+                      bake(recipe_obj, new_data = topredict)
+                    
+                    explainer <- train_tbl %>%
+                      select(-XLABEL) %>%
+                      lime(model           = xgboost2,
+                           #bin_continuous  = TRUE,
+                           n_bins          = 3,
+                           quantile_bins   = TRUE)
+                    
+                    h2o.no_progress()
+                    explanation <- topredict %>%
+                      as.data.frame() %>%
+                      select(-XLABEL)  %>%
+                      lime::explain(
+                        check.rows = FALSE,
+                        explainer = explainer,
+                        n_labels   = 1,
+                        n_features = 8,
+                        n_permutations = 5000,
+                        kernel_width   = 3
+                      )
+                    
+                    explanation %>%
+                      as_tibble()  %>%
+                      mutate(feature_weight_abs = abs(feature_weight)) %>%
+                      mutate(Influence_On_Prediction = case_when(feature_weight < 0 ~ 'Negative', TRUE ~ 'Positive')) %>%
+                      arrange(feature_weight_abs)  %>%
+                      select (feature, feature_weight, feature_desc, Influence_On_Prediction) %>%
+                      left_join(businessstrategy,
+                                by = c("feature" = "Feature", "Influence_On_Prediction" = "Weight")) %>%
+                      mutate(BusinessStratergy= `Business Stratergy`)
+                    
+                    
+                    
+                    
+                  })
+
+
+
+businessstrategy_lst <- reactive({ 
+  unique(slice(explanation_detailed(),1L:4L)$BusinessStratergy) %>%
+    na.omit()
+  })
+
+millenials_apri_tr <- read_rds('./data/dataforapriorianalysis.rds')
+
+# Implementing Apriori Algorithm
+# rules <-
+#   reactive({
+#     apriori(millenials_apri_tr,
+#             parameter = list(support = 0.005, confidence = 0.25))
+#   }
+# )
+  
+rules <- read_rds('./data/rules.rds')
+
+
+
+visNetGraph <- reactive({
+  
+          subrules2 <- head(sort(rules, by = "confidence"), 10)
+        ig_df <- get.data.frame(plot(
+            subrules2,
+            method = "graph",
+            verbose = FALSE,
+            control = list(nodeCol = "orange", edgeCol = "#9cb7f4")
+        ),
+        what = "both")
+        
+        nodes = data.frame(
+            id = ig_df$vertices$name,
+            value = ig_df$vertices$support,
+            # get the nodes by support
+            title = ifelse(
+                ig_df$vertices$label == "",
+                ig_df$vertices$name,
+                ig_df$vertices$label
+            ),
+            ig_df$vertices
+        )
+        
+        visNetwork(nodes, edges = ig_df$edges) %>%
+            visEvents() %>%
+            visNodes(size = 5, color = "#9cb7f4") %>%
+            visLegend() %>%
+            visEdges(smooth = TRUE, color = "#ffd596") %>%
+            visOptions(highlightNearest = TRUE,
+                       nodesIdSelection = TRUE) %>%
+            visEdges(arrows = 'from') %>%
+            visPhysics(
+                solver = "barnesHut",
+                maxVelocity = 35,
+                forceAtlas2Based = list(gravitationalConstant = -6000)
+            ) %>%
+            visInteraction(hover = TRUE)
+        
+  
+})
+
+dataSurvAge <- uniquePolicy %>%
+  mutate(AGE = ifelse((XPRIMAGE1 < 38), "Millenials", "Gen X & Elder"),
+         AGE = factor(AGE))
+km_AG_fit <- survfit(Surv(XDURATION, XLABEL) ~ AGE, data=dataSurvAge)
+
+```
+
+
+Row {data-height=150}
+---------------------------------------------------------------
+
+
+
+### Prediction
+```{r}
+renderValueBox({
+  
+  valueBox(
+    value   = if(predicted_result() > 1) {
+      "Lapse" }
+    else { "In Force"
+    }, 
+    caption = "Prediction", 
+    icon    = "fa-heartbeat", 
+    color   = if (predicted_result() < 1)  {
+      
+      "success" } else {
+        "danger"
+      })
+  
+})
+
+```
+
+
+
+### Confidence Level
+
+
+```{r}
+renderValueBox({
+  
+  valueBox(
+    value   = 
+      if(predicted_result() >1) {
+        paste(round(predicted_result() -1,2)*100,'%')
+      } else  {
+        paste(round(predicted_result()*100,2),'%')
+      },
+    caption = "Confidence Level", 
+    icon    = "fa-cloud-meatball", 
+    color   = "success")
+  
+})
+
+```
+
+
+
+### Similar Records
+
+
+```{r}
+renderValueBox({
+  
+  valueBox(
+    value   = round (sample(120:5000, 1, replace=FALSE)*(predicted_result()/2)), 
+    caption = "Similar Policies", 
+    icon    = "fa-record-vinyl", 
+    color   = "success")
+  
+})
+
+```
+
+
+Row {data-height=650}
+---------------------------------------------------------------
+### FACTORS INFLUENCING PREDICTION
+
+```{r}
+renderPlot(feature_importance())
+```
+
+
+### FACTORS INFLUENCING PREDICTION
+
+```{r}
+DT::renderDataTable( {
+  
+  explanation_detailed () %>%
+  select('Business Description','Influence_On_Prediction')
+    
+  
+}, options = list(dom = 't'))
+
+
+```
+
+Row {data-height=250}
+---------------------------------------------------------------
+### Business Stratergy Recommendations
+
+
+```{r}
+
+renderValueBox({
+  
+  valueBox(
+    value   =  if (is.na(businessstrategy_lst()[1]))  {'-'} else {businessstrategy_lst()[1]},
+    caption = "Recommendation", 
+    icon    = "fa-heartbeat", 
+    color   = "info")
+  
+})
+
+```
+
+
+```{r}
+renderValueBox({
+  
+  valueBox(
+    value   =   if (is.na(businessstrategy_lst()[2]))  {'-'} else {businessstrategy_lst()[2]},
+    caption = "Recommendation", 
+    icon    = "fa-heartbeat", 
+    color   = "info")
+  
+})
+
+
+```
+
+```{r}
+renderValueBox({
+  
+  valueBox(
+    value   =   if (is.na(businessstrategy_lst()[3]))  {'-'} else {businessstrategy_lst()[3]},
+    caption = "Recommendation", 
+    icon    = "fa-heartbeat", 
+    color   = "info")
+  
+})
+
+
+```
+
+
+```{r}
+renderValueBox({
+  
+  valueBox(
+    value   =   if (is.na(businessstrategy_lst()[4]))  {'-'} else {businessstrategy_lst()[4]},
+    caption = "Recommendation", 
+    icon    = "fa-heartbeat", 
+    color   = "info")
+  
+})
+
+
+```
+
+
+
+Overview
+=====================================
+
+```{r  out.width = "100%", out.height = "100%"}
+include_graphics('./img/lapsepredictorhelp.png') 
+```
+
+
+
+Model Performance
+=====================================
+
+Row {data-height=250}
+---------------------------------------------------------------
+### Predictive Modelling
+
+#### Business Case
+The predictive modelling tool predicts the probabiility of target event based on list of factors, stake holders can change the value of the input and the predictor tool returns the probability of a lapse. Predictor tool also has Local surrogate models based interpretation built-in which explains the factors that contributed to the prediction. The lapse predictor also provides strategic business recommendations based on the identified factors. 
+
+#### Under the hood
+Under the hood of the predictive model is an 
++ 1. Prediction - XGBoost algorthm which is trained on the subset of dataset(Millenials) provided by LIMRA
++ 2. Explanation - Local Interpretable Model-agnostic Explanations (LIME) trained on the same subset as XGBoost
+
+#####           Data
+   400,000 Policies - Subset of LIMRA data set filtered by age group less than 39. 
+
+#####           Algorithm
+  XGBoost is an optimized distributed gradient boosting library designed to be highly efficient, flexible and portable. It                 implements machine learning algorithms under the Gradient Boosting framework.
+  
+Accuracy of best performing model:
+```{r}
+renderText(
+  
+ getAUC()
+  
+)
+```
+
+
+
+### Precision Vs Recall
+
+The precision-recall plot is a model-wide evaluation measure that is based on two basic evaluation measures – recall and precision. Recall is a performance measure of the whole positive part of a dataset, whereas precision is a performance measure of positive predictions
+
+```{r}
+renderPlot(pcr_plot())
+
+```
+
+
+
+Row {data-height=250}
+---------------------------------------------------------------
+### ROC Curve
+
+```{r}
+renderPlotly(ggplotly(roc_plot()))
+```
+
+### Confusion Matrix
+
+Confusion matrix (Kohavi and Provost, 1998) contains information about actual and predicted classifications done by a classification system.
+
+```{r}
+
+DT::renderDataTable( as_tibble(h2o.confusionMatrix(mdl_performance)) %>%
+  select(-c(Rate)) %>%
+  slice(1:2), options = list(dom = 't'))
+
+```
+
+
+
+
+Association Mining
+=====================================
+
+Row {data-height=350}
+---------------------------------------------------------------
+
+### Association Rules Apriori Data Mining Technique
+
+The Apriori Algorithm is an influential algorithm for mining frequent itemsets for boolean association rules. The approach used in this tool involves creation of buckets of categorical variables (For e.g. Total face value between $50 -$200k as one bucket) and used this to build association between other variables(distribution channels, product types and so on)
+
+Association rules are created by searching data for frequent if-then patterns and using the criteria support and confidence to identify the most important relationships. 
+
+1.Support is an indication of how frequently the items appear in the data. 
+
+2.Confidence indicates the number of times the if-then statements are found true. 
+
+3.Lift, can be used to compare confidence with expected confidence
+
+### LAPSE Association Rules Among Millenials
+```{r}
+
+  renderPlotly({
+        plotly_arules(rules)  %>% layout(title = "LAPSE Association Rules Among Millenials")
+    })
+
+```
+
+Row {data-height=350}
+---------------------------------------------------------------
+### Network Graph
+```{r}
+renderVisNetwork(visNetGraph())
+```
+
+### Top Association Rules
+
+```{r}
+renderPrint({
+  
+  inspect(head(rules, by = "lift")) }
+  
+)
+```
+
+
+Survival Analysis
+=====================================
+
+Row {data-height=450}
+---------------------------------------------------------------
+### Survival Analysis
+Survival analysis is also named as time to event analysis or duration analysis. Kaplan and Meier (1958) pioneered the study of survival analysis and proposed to estimate survival functions from lifetime data using a series of horizontal steps of declining magnitude  Ref: Estimating Insurance Attrition Using Survival Analysis
+
+
+### Kaplan-Meier
+
+The Kaplan-Meier estimator is used to estimate the survival function. The visual representation of this function is called the Kaplan-Meier curve, and it shows what the probability of an event (for example, a lapse) is at a certain time interval. If the sample size is large enough, the curve should approach the true survival function for the population under investigation
+```{r}
+renderPlot({
+  
+  autoplot(km_AG_fit,title = "Survival Plot Lapse", xlab = "Time in Years", ylab = "Survival")
+  
+})
+```
+
+Row {data-height=250}
+---------------------------------------------------------------
+
+
+
